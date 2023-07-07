@@ -464,117 +464,187 @@ export function matchRoutes<
     return null;
   }
 
-  let branches = flattenRoutes(routes);
-  rankRouteBranches(branches);
+  pathname = safelyDecodeURI(pathname);
 
-  let matches = null;
-  for (let i = 0; matches == null && i < branches.length; ++i) {
-    matches = matchRouteBranch<string, RouteObjectType>(
-      branches[i],
-      // Incoming pathnames are generally encoded from either window.location
-      // or from router.navigate, but we want to match against the unencoded
-      // paths in the route definitions.  Memory router locations won't be
-      // encoded here but there also shouldn't be anything to decode so this
-      // should be a safe operation.  This avoids needing matchRoutes to be
-      // history-aware.
-      safelyDecodeURI(pathname)
-    );
+  let candidates: RouteBranch[] = [];
+  let matchingCandidates: RouteBranch[] = [];
+  // prepeare candidates for path check
+  for (let i=0; i<routes.length; ++i) {
+    let route = routes[i];
+    candidates.push({
+      routesMeta: [
+        {
+          route,
+          childrenIndex: i,
+          pathname: '',
+          pathnameBase: ''
+        }
+      ],
+      currentRoute: route,
+      routePath: route.path,
+      parentPath: '',
+      matchedPathname: '/',
+      matchedParams: {},
+      fullPath: '',
+      visited: false,
+      isEnd: false,
+      score: 0
+    });
   }
 
-  return matches;
+  while(candidates.length) {
+    let candidate = candidates.shift();
+    if (!candidate) continue;
+
+    let { routesMeta, parentPath, currentRoute, matchedPathname, routePath, visited, isEnd } = candidate;
+    let currentMatchMeta = routesMeta[routesMeta.length - 1];
+
+    if (visited) {
+      if (isEnd) {
+        matchingCandidates.push(candidate);
+      }
+      continue;
+    }
+
+    if (routePath === "" || !routePath?.includes("?")) {
+      candidate.visited = true;
+      if (routePath?.startsWith('/')) {
+        invariant(
+          routePath.startsWith(parentPath),
+          `Absolute route path "${routePath}" nested under path ` +
+            `"${parentPath}" is not valid. An absolute child route path ` +
+            `must start with the combined path of all its parent routes.`
+        );
+      }
+
+      if (currentRoute.children && currentRoute.children.length > 0) {
+        invariant(
+          // Our types know better, but runtime JS may not!
+          // @ts-expect-error
+          currentRoute.index !== true,
+          `Index routes must not have child routes. Please remove ` +
+            `all child routes from route path "${parentPath}/".`
+        );
+      }
+
+      let relativePath = (routePath?.startsWith('/'))
+        ? routePath.slice(parentPath.length)
+        : routePath || "";
+
+      let path = joinPaths([parentPath, relativePath]);
+
+      let remainingPathname =
+        matchedPathname === "/"
+        ? pathname
+        : pathname.slice(matchedPathname.length) || "/";
+
+      let end = (currentRoute.children || []).length === 0;
+      let match = matchPath(
+        { path: relativePath, caseSensitive: currentRoute.caseSensitive === true, end},
+        remainingPathname
+      );
+
+      // if the route doesn't match ... don't go deeper
+      if (!match) continue;
+
+      candidate.fullPath = joinPaths([candidate.fullPath, relativePath]);
+      candidate.matchedParams = {...candidate.matchedParams, ...match.params};
+      let finalRemainingPathname = remainingPathname.slice(match.pathname.length);
+      let endOfPath = finalRemainingPathname === '' || finalRemainingPathname === '/';
+      candidate.isEnd = endOfPath;
+
+      // Routes without a path shouldn't ever match by themselves unless they are
+      // index routes, so don't add them to the list of possible branches.
+      if (end && routePath == null && !currentRoute.index) continue;
+      currentMatchMeta.pathname = joinPaths([matchedPathname, match.pathname]);
+      currentMatchMeta.pathnameBase = normalizePathname(
+        joinPaths([matchedPathname, match.pathnameBase])
+      );
+
+      if (match.pathnameBase !== "/") {
+        matchedPathname = joinPaths([matchedPathname, match.pathnameBase]);
+      }
+
+      candidates.unshift(candidate);
+      // because we should handle "first discovered route is winner", we have to iterate
+      // backward in this iterative dfs
+      for (let i=(currentRoute.children || []).length-1; i>=0; --i) {
+        let child = currentRoute.children![i];
+        candidates.unshift({
+          routesMeta: [...candidate.routesMeta, {route: child, childrenIndex: i, pathname: '', pathnameBase: ''}],
+          routePath: child.path,
+          currentRoute: child,
+          parentPath: path,
+          matchedParams: candidate.matchedParams,
+          matchedPathname,
+          fullPath: candidate.fullPath,
+          visited: false,
+          isEnd: false,
+          score: 0
+        });
+      }
+    } else {
+      // if the route include dynamic params, we have to handle new candidate for each combinaison
+      for (let exploded of explodeOptionalSegments(routePath).reverse()) {
+        let newCandidate = {...candidate};
+        newCandidate.routePath = exploded;
+        candidates.unshift(newCandidate);
+      }
+    }
+  }
+
+  if (matchingCandidates.length) {
+    // score candidates
+    matchingCandidates.map((m) => {
+      m.score = computeScore(m.fullPath, m.currentRoute.index);
+    });
+
+    matchingCandidates.sort((a, b) =>
+      a.score !== b.score
+        ? b.score - a.score // Higher score first
+        : compareIndexes(
+            a.routesMeta.map((meta) => meta.childrenIndex),
+            b.routesMeta.map((meta) => meta.childrenIndex)
+          )
+      );
+
+    return matchingCandidates[0].routesMeta.map((m) => {
+      // clean extra meta attributes
+      return {
+        params: matchingCandidates[0].matchedParams,
+        pathname: m.pathname,
+        pathnameBase: m.pathnameBase,
+        route: m.route as any // !! lack of TypeScript skills and time ...
+      };
+    });
+  }
+
+  return null;
 }
 
 interface RouteMeta<
   RouteObjectType extends AgnosticRouteObject = AgnosticRouteObject
 > {
-  relativePath: string;
-  caseSensitive: boolean;
+  pathname: string;
+  pathnameBase: string;
   childrenIndex: number;
   route: RouteObjectType;
 }
 
 interface RouteBranch<
+  ParamKey extends string = string,
   RouteObjectType extends AgnosticRouteObject = AgnosticRouteObject
 > {
-  path: string;
-  score: number;
   routesMeta: RouteMeta<RouteObjectType>[];
-}
-
-function flattenRoutes<
-  RouteObjectType extends AgnosticRouteObject = AgnosticRouteObject
->(
-  routes: RouteObjectType[],
-  branches: RouteBranch<RouteObjectType>[] = [],
-  parentsMeta: RouteMeta<RouteObjectType>[] = [],
-  parentPath = ""
-): RouteBranch<RouteObjectType>[] {
-  let flattenRoute = (
-    route: RouteObjectType,
-    index: number,
-    relativePath?: string
-  ) => {
-    let meta: RouteMeta<RouteObjectType> = {
-      relativePath:
-        relativePath === undefined ? route.path || "" : relativePath,
-      caseSensitive: route.caseSensitive === true,
-      childrenIndex: index,
-      route,
-    };
-
-    if (meta.relativePath.startsWith("/")) {
-      invariant(
-        meta.relativePath.startsWith(parentPath),
-        `Absolute route path "${meta.relativePath}" nested under path ` +
-          `"${parentPath}" is not valid. An absolute child route path ` +
-          `must start with the combined path of all its parent routes.`
-      );
-
-      meta.relativePath = meta.relativePath.slice(parentPath.length);
-    }
-
-    let path = joinPaths([parentPath, meta.relativePath]);
-    let routesMeta = parentsMeta.concat(meta);
-
-    // Add the children before adding this route to the array so we traverse the
-    // route tree depth-first and child routes appear before their parents in
-    // the "flattened" version.
-    if (route.children && route.children.length > 0) {
-      invariant(
-        // Our types know better, but runtime JS may not!
-        // @ts-expect-error
-        route.index !== true,
-        `Index routes must not have child routes. Please remove ` +
-          `all child routes from route path "${path}".`
-      );
-
-      flattenRoutes(route.children, branches, routesMeta, path);
-    }
-
-    // Routes without a path shouldn't ever match by themselves unless they are
-    // index routes, so don't add them to the list of possible branches.
-    if (route.path == null && !route.index) {
-      return;
-    }
-
-    branches.push({
-      path,
-      score: computeScore(path, route.index),
-      routesMeta,
-    });
-  };
-  routes.forEach((route, index) => {
-    // coarse-grain check for optional params
-    if (route.path === "" || !route.path?.includes("?")) {
-      flattenRoute(route, index);
-    } else {
-      for (let exploded of explodeOptionalSegments(route.path)) {
-        flattenRoute(route, index, exploded);
-      }
-    }
-  });
-
-  return branches;
+  routePath: string | undefined;
+  currentRoute: RouteObjectType;
+  parentPath: string;
+  matchedPathname: string;
+  fullPath: string;
+  visited: boolean;
+  isEnd: boolean;
+  matchedParams: Params<ParamKey>;
+  score: number;
 }
 
 /**
@@ -636,17 +706,6 @@ function explodeOptionalSegments(path: string): string[] {
   );
 }
 
-function rankRouteBranches(branches: RouteBranch[]): void {
-  branches.sort((a, b) =>
-    a.score !== b.score
-      ? b.score - a.score // Higher score first
-      : compareIndexes(
-          a.routesMeta.map((meta) => meta.childrenIndex),
-          b.routesMeta.map((meta) => meta.childrenIndex)
-        )
-  );
-}
-
 const paramRe = /^:\w+$/;
 const dynamicSegmentValue = 3;
 const indexRouteValue = 2;
@@ -693,54 +752,6 @@ function compareIndexes(a: number[], b: number[]): number {
     : // Otherwise, it doesn't really make sense to rank non-siblings by index,
       // so they sort equally.
       0;
-}
-
-function matchRouteBranch<
-  ParamKey extends string = string,
-  RouteObjectType extends AgnosticRouteObject = AgnosticRouteObject
->(
-  branch: RouteBranch<RouteObjectType>,
-  pathname: string
-): AgnosticRouteMatch<ParamKey, RouteObjectType>[] | null {
-  let { routesMeta } = branch;
-
-  let matchedParams = {};
-  let matchedPathname = "/";
-  let matches: AgnosticRouteMatch<ParamKey, RouteObjectType>[] = [];
-  for (let i = 0; i < routesMeta.length; ++i) {
-    let meta = routesMeta[i];
-    let end = i === routesMeta.length - 1;
-    let remainingPathname =
-      matchedPathname === "/"
-        ? pathname
-        : pathname.slice(matchedPathname.length) || "/";
-    let match = matchPath(
-      { path: meta.relativePath, caseSensitive: meta.caseSensitive, end },
-      remainingPathname
-    );
-
-    if (!match) return null;
-
-    Object.assign(matchedParams, match.params);
-
-    let route = meta.route;
-
-    matches.push({
-      // TODO: Can this as be avoided?
-      params: matchedParams as Params<ParamKey>,
-      pathname: joinPaths([matchedPathname, match.pathname]),
-      pathnameBase: normalizePathname(
-        joinPaths([matchedPathname, match.pathnameBase])
-      ),
-      route,
-    });
-
-    if (match.pathnameBase !== "/") {
-      matchedPathname = joinPaths([matchedPathname, match.pathnameBase]);
-    }
-  }
-
-  return matches;
 }
 
 /**
